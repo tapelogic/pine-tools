@@ -23,9 +23,10 @@ which level groups to show based on the chart timeframe.
 Every confirmed signal fires an alert with the signal type, level name, level
 price and ticker.
 
-![Key Levels on EURUSD 4h](screenshot1)
-![Key Levels on BTCUSD 4h](screenshot2)
+![Key Levels on EURUSD 4h](EURUSD_2026-09-22_16-59-07.png)
+
+![Key Levels on BTCUSD 4h](BTCUSD_2026-09-22_17-36-07.png)
 
 ## Contact
 
-Open an issue here, or message me on TradingView: tapelogic# pine-tools
+Open an issue here, or message me on TradingView: tapelogic
