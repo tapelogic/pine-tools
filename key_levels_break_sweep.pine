@@ -1,0 +1,189 @@
+//@version=6
+indicator("Key Levels — Break & Sweep", "KL B/S", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// Anchors the script to the main price scale. Must stay: a script that only
+// draws lines/labels and has no plot gets its own separate price scale.
+plot(close, "Anchor", color = color.new(color.gray, 100), editable = false)
+
+// ───────── Inputs ─────────
+gG      = "General"
+histN   = input.int(0, "History depth (periods, 0 = as far back as possible)", minval = 0, maxval = 500, group = gG,
+     tooltip = "0 keeps as much history as TradingView's 500-line / 500-label limits allow, split evenly across whichever levels are currently shown on this timeframe. A positive number shortens history for a cleaner chart (still capped at whatever the limits allow).")
+extB    = input.int(20, "Extend current level (bars)", minval = 0, maxval = 100, group = gG)
+tolAtr  = input.float(0.05, "Touch tolerance (× ATR)", minval = 0, maxval = 1, step = 0.01, group = gG)
+maxWait = input.int(3, "Confirmation window (bars)", minval = 1, maxval = 10, group = gG)
+
+gC   = "Colors"
+colD = input.color(#2962FF, "Day",   group = gC)
+colW = input.color(#FF9800, "Week",  group = gC)
+colM = input.color(#9C27B0, "Month", group = gC)
+
+gS   = "Signals"
+sigD = input.bool(false, "Day signals",   group = gS)
+sigW = input.bool(true,  "Week signals",  group = gS)
+sigM = input.bool(true,  "Month signals", group = gS)
+
+// ───────── Which groups this timeframe shows ─────────
+int cs = timeframe.in_seconds()
+bool useD = cs <= 900                                    // 15m and below
+bool useW = cs < 86400                                   // below Daily
+bool useM = cs > 900 and cs < timeframe.in_seconds("M")  // above 15m, below Monthly
+
+// ───────── Auto history budget ─────────
+// Share TradingView's 500-line / 500-label caps only across the levels that
+// are actually active on the current timeframe (2 or 4, never all 6), so
+// unused capacity on higher timeframes goes into deeper history instead of
+// sitting idle. A small safety margin (490 of 500) is kept on both caps.
+// Each active level costs (hN + 1) lines (1 live + hN history) and up to
+// (hN + 2) labels (1 right-edge + up to hN+1 signal markers, since at most
+// one signal fires per level per retained period) — hNauto is the largest hN
+// that keeps both totals under the margin.
+int activeLevelCount = (useD ? 2 : 0) + (useW ? 2 : 0) + (useM ? 2 : 0)
+int lineBudget  = 490
+int labelBudget = 490
+int hNauto = activeLevelCount > 0 ? math.max(1, math.min(
+     int(lineBudget  / activeLevelCount) - 1,
+     int(labelBudget / activeLevelCount) - 2)) : 1
+int hN = histN == 0 ? hNauto : math.min(histN, hNauto)
+
+// ───────── Previous-period values (non-repainting) ─────────
+[dH, dL] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[wH, wL] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[mH, mL] = request.security(syminfo.tickerid, "M", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+bool nD = timeframe.change("D")
+bool nW = timeframe.change("W")
+bool nM = timeframe.change("M")
+
+float tol = ta.atr(14) * tolAtr
+float pc  = close[1]
+
+// ───────── Level ─────────
+type Lv
+    string       nm
+    color        cl
+    bool         isHigh
+    array<line>  hist       // finished-period segments, oldest first
+    array<int>   histX1     // x1 of each entry in `hist`, same order
+    array<label> sigLbls    // this level's own signal markers, oldest first
+    array<int>   sigBarIdx  // trigger/confirm bar of each entry in `sigLbls`
+    float        p        = na
+    line         ln       = na
+    label        lb       = na
+    int          touches  = 0
+    bool         inTouch  = false
+    bool         fired    = false
+    int          pDir     = 0
+    int          pKind    = 0
+    int          pBar     = 0
+    float        trigHi   = na   // trigger candle's high, for the stricter confirmation
+    float        trigLo   = na   // trigger candle's low,  for the stricter confirmation
+    int          curStart = 0
+
+// New period: close the old segment, keep it as history (trimmed to hN), and
+// drop any signal markers that are now older than the oldest retained segment
+// — so a level's markers never outlive (or outlast) its own visible history.
+method roll(Lv lv, float price, int hN, int eB) =>
+    if not na(lv.ln)
+        lv.ln.set_x2(bar_index - 1)
+        lv.ln.set_color(color.new(lv.cl, 65))
+        lv.hist.push(lv.ln)
+        lv.histX1.push(lv.curStart)
+        while lv.hist.size() > hN
+            line.delete(lv.hist.shift())
+            lv.histX1.shift()
+        int cutoff = lv.histX1.size() > 0 ? lv.histX1.get(0) : bar_index
+        while lv.sigLbls.size() > 0 and lv.sigBarIdx.get(0) < cutoff
+            label.delete(lv.sigLbls.shift())
+            lv.sigBarIdx.shift()
+    lv.p        := price
+    lv.touches  := 0
+    lv.inTouch  := false
+    lv.fired    := false
+    lv.pDir     := 0
+    lv.curStart := bar_index
+    lv.ln       := line.new(bar_index, price, bar_index + eB, price, color = lv.cl, width = 1, force_overlay = true)
+    lv.ln.set_x2(bar_index + eB)
+
+// Touch counting + signal state machine (closed bars only)
+method step(Lv lv, float tol_, float pc_, bool sigOn, int wait) =>
+    float p = lv.p
+
+    bool t = high >= p - tol_ and low <= p + tol_
+    if t and not lv.inTouch
+        lv.touches := lv.touches + 1
+    lv.inTouch := t
+
+    if sigOn and lv.pDir != 0
+        bool bull = lv.pDir == 1
+        // Stricter confirmation: the confirmation candle must close beyond the
+        // level, be directional, AND close beyond the trigger candle's own
+        // high/low — plain follow-through past the level is no longer enough.
+        bool conf = bull ? (close > p and close > open and close > lv.trigHi) : (close < p and close < open and close < lv.trigLo)
+        bool dead = bull ? close < p : close > p
+        if conf
+            string kind = lv.pKind == 1 ? "Brk " : "Swp "
+            label lbl = label.new(bar_index, bull ? low : high, kind + lv.nm, yloc = bull ? yloc.belowbar : yloc.abovebar, style = bull ? label.style_label_up : label.style_label_down, color = color.new(lv.cl, 10), textcolor = color.white, size = size.tiny, tooltip = kind + lv.nm + "  " + str.tostring(p, format.mintick), force_overlay = true)
+            lv.sigLbls.push(lbl)
+            lv.sigBarIdx.push(bar_index)
+            alert(kind + lv.nm + " " + str.tostring(p, format.mintick) + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+            lv.fired := true
+            lv.pDir  := 0
+        else if dead or bar_index - lv.pBar >= wait
+            lv.pDir := 0
+
+    if sigOn and not lv.fired and lv.pDir == 0
+        int dir  = 0
+        int kind = 0
+        if lv.isHigh
+            if close > p and pc_ <= p
+                dir  := 1
+                kind := 1
+            else if high > p and math.max(open, close) < p
+                dir  := -1
+                kind := 2
+        else
+            if close < p and pc_ >= p
+                dir  := -1
+                kind := 1
+            else if low < p and math.min(open, close) > p
+                dir  := 1
+                kind := 2
+        if dir != 0
+            lv.pDir  := dir
+            lv.pKind := kind
+            lv.pBar  := bar_index
+            lv.trigHi := high
+            lv.trigLo := low
+
+// Right-edge label: name, price, touch count
+method drawLbl(Lv lv, int eB) =>
+    label.delete(lv.lb)
+    lv.lb := label.new(bar_index + eB, lv.p, "", style = label.style_label_left, color = color.new(color.black, 100), textcolor = lv.cl, size = size.small, force_overlay = true)
+    lv.lb.set_text(lv.nm + "  " + str.tostring(lv.p, format.mintick) + "  ×" + str.tostring(lv.touches))
+
+method sync(Lv lv, bool on, bool isNew, float price, float tol_, float pc_, bool sigOn, int hN, int eB, int wait) =>
+    if on and not na(price)
+        if na(lv.p) or isNew
+            lv.roll(price, hN, eB)
+        if not na(lv.ln)
+            lv.ln.set_x2(bar_index + eB)
+        if barstate.isconfirmed
+            lv.step(tol_, pc_, sigOn, wait)
+        if barstate.islast
+            lv.drawLbl(eB)
+
+// ───────── Levels ─────────
+var Lv pdh = Lv.new("PDH", colD, true,  array.new<line>(), array.new<int>(), array.new<label>(), array.new<int>())
+var Lv pdl = Lv.new("PDL", colD, false, array.new<line>(), array.new<int>(), array.new<label>(), array.new<int>())
+var Lv pwh = Lv.new("PWH", colW, true,  array.new<line>(), array.new<int>(), array.new<label>(), array.new<int>())
+var Lv pwl = Lv.new("PWL", colW, false, array.new<line>(), array.new<int>(), array.new<label>(), array.new<int>())
+var Lv pmh = Lv.new("PMH", colM, true,  array.new<line>(), array.new<int>(), array.new<label>(), array.new<int>())
+var Lv pml = Lv.new("PML", colM, false, array.new<line>(), array.new<int>(), array.new<label>(), array.new<int>())
+
+pdh.sync(useD, nD, dH, tol, pc, sigD, hN, extB, maxWait)
+pdl.sync(useD, nD, dL, tol, pc, sigD, hN, extB, maxWait)
+pwh.sync(useW, nW, wH, tol, pc, sigW, hN, extB, maxWait)
+pwl.sync(useW, nW, wL, tol, pc, sigW, hN, extB, maxWait)
+pmh.sync(useM, nM, mH, tol, pc, sigM, hN, extB, maxWait)
+pml.sync(useM, nM, mL, tol, pc, sigM, hN, extB, maxWait)
